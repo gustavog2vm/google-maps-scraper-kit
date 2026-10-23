@@ -9,7 +9,7 @@ set -euo pipefail
 ENV_FILE="$(cd "$(dirname "$0")/.." && pwd)/.env"
 if [ -f "$ENV_FILE" ]; then
   while IFS='=' read -r k v || [ -n "$k" ]; do
-    case "$k" in SCRAPER_BASE_URL|SCRAPER_PORT|SCRAPER_API_KEY) ;; *) continue ;; esac
+    case "$k" in SCRAPER_BASE_URL|SCRAPER_PORT|SCRAPER_API_KEY|SCRAPER_LANG) ;; *) continue ;; esac
     v="${v%$'\r'}"; v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
     [ -n "${!k+x}" ] || export "$k=$v"
   done < "$ENV_FILE"
@@ -17,6 +17,8 @@ fi
 
 BASE="${SCRAPER_BASE_URL:-http://localhost:${SCRAPER_PORT:-8080}}"
 KEY="${SCRAPER_API_KEY:-}"
+# Google Maps language for categories (two letters: en, pt, es...). Not $LANG: that one is the shell locale.
+HL="${SCRAPER_LANG:-en}"
 # NOTE: empty-array expansion needs the ${a[@]+...} guard — plain "${AUTH[@]}" is an
 # unbound-variable error under 'set -u' on bash 3.2 (stock macOS), which is the
 # common case here since local use needs no API key.
@@ -35,10 +37,10 @@ if ! curl -s -m 5 ${AUTH[@]+"${AUTH[@]}"} "$BASE/api/v1/jobs" >/dev/null 2>&1; t
   exit 1
 fi
 
-echo "▶ Creating job: \"$KEYWORD\" @ $LAT,$LON depth=$DEPTH (email extraction ON)"
+echo "▶ Creating job: \"$KEYWORD\" @ $LAT,$LON depth=$DEPTH lang=$HL (email extraction ON)"
 # email:true makes the engine visit each business website for emails (the key lead field). A little slower.
-BODY=$(printf '{"name":"scrape-cli","keywords":["%s"],"lang":"en","zoom":15,"lat":"%s","lon":"%s","fast_mode":false,"radius":10000,"depth":%s,"email":true,"max_time":600}' \
-  "$KEYWORD" "$LAT" "$LON" "$DEPTH")
+BODY=$(printf '{"name":"scrape-cli","keywords":["%s"],"lang":"%s","zoom":15,"lat":"%s","lon":"%s","fast_mode":false,"radius":10000,"depth":%s,"email":true,"max_time":600}' \
+  "$KEYWORD" "$HL" "$LAT" "$LON" "$DEPTH")
 ID=$(curl -s -X POST "$BASE/api/v1/jobs" ${AUTH[@]+"${AUTH[@]}"} -H "Content-Type: application/json" -d "$BODY" \
      | grep -oE '[a-f0-9-]{36}' | head -1 || true)
 [ -n "$ID" ] || { echo "✗ Failed to create job (check required fields)." >&2; exit 1; }
@@ -60,14 +62,18 @@ RAW="$(mktemp)"
 echo "▶ Downloading…"
 curl -s ${AUTH[@]+"${AUTH[@]}"} "$BASE/api/v1/jobs/$ID/download" -o "$RAW"
 
-# Trim the raw 34-column CSV to the 8 lead fields (drops coordinates, IDs, hours, images).
+# Trim the raw 34-column CSV to the 8 lead fields (drops coordinates, IDs, hours, images), and
+# clean emails and addresses the same way scrape.py does (clean_row).
 if command -v python3 >/dev/null 2>&1; then
-  python3 - "$RAW" "$OUT" <<'PY'
-import csv, sys
-LEAD = ["title", "phone", "emails", "website", "category", "address", "review_rating", "review_count"]
-with open(sys.argv[1], newline='') as f:
-    rows = list(csv.DictReader(f))
-with open(sys.argv[2], "w", newline='') as f:
+  python3 - "$RAW" "$OUT" "$(cd "$(dirname "$0")" && pwd)/scrape.py" <<'PY'
+import csv, importlib.util, sys
+spec = importlib.util.spec_from_file_location("scrape", sys.argv[3])
+scrape = importlib.util.module_from_spec(spec); spec.loader.exec_module(scrape)
+scrape.utf8_console()
+LEAD = scrape.LEAD
+with open(sys.argv[1], newline='', encoding="utf-8", errors="replace") as f:
+    rows = [scrape.clean_row(r) for r in csv.DictReader(f)]
+with open(sys.argv[2], "w", newline='', encoding="utf-8-sig") as f:
     w = csv.DictWriter(f, fieldnames=LEAD); w.writeheader()
     for r in rows:
         w.writerow({k: r.get(k, "") for k in LEAD})

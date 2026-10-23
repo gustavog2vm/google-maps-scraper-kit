@@ -85,6 +85,38 @@ class ExtractEmails(unittest.TestCase):
         self.assertEqual(scrape.extract_emails("no emails here", "x.com"), [])
 
 
+class CleanRow(unittest.TestCase):
+    def test_engine_emails_drop_images(self):
+        self.assertEqual(scrape.clean_emails("nuvempago@2x.png, visa@2x.png, pix@2x.png"), "")
+        self.assertEqual(scrape.clean_emails("Sales@Acme.com, logo@3x.webp,sales@acme.com; a@b.io"),
+                         "sales@acme.com, a@b.io")
+        self.assertEqual(scrape.clean_emails(""), "")
+
+    def test_address_drops_title_prefix(self):
+        ca = scrape.clean_address
+        self.assertEqual(ca("Protefix - Proteção e Fixação",
+                            "Protefix - Proteção e Fixação - Av. Farrapos, 2181 - São Geraldo, Porto Alegre - RS"),
+                         "Av. Farrapos, 2181 - São Geraldo, Porto Alegre - RS")
+        self.assertEqual(ca("Joe's", "joe's, 1 Main St"), "1 Main St")
+        self.assertEqual(ca("Main", "Main Street 5, Austin"), "Main Street 5, Austin")  # no separator: keep
+        self.assertEqual(ca("Acme", "Acme - "), "Acme -")  # nothing left: keep the original
+        self.assertEqual(ca("", "1 Main St"), "1 Main St")
+
+    def test_clean_row_skips_missing_columns(self):
+        self.assertEqual(scrape.clean_row({"title": "x"}), {"title": "x"})
+
+
+class Utf8Console(unittest.TestCase):
+    def test_cp1252_stream_prints_marks(self):
+        buf = io.BytesIO()
+        stream = io.TextIOWrapper(buf, encoding="cp1252")
+        with mock.patch.object(sys, "stdout", stream), mock.patch.object(sys, "stderr", stream):
+            scrape.utf8_console()
+            print("ℹ ▶ ✓", file=sys.stdout)
+            sys.stdout.flush()
+        self.assertEqual(buf.getvalue().decode("utf-8").strip(), "ℹ ▶ ✓")
+
+
 class ContactLinks(unittest.TestCase):
     def test_discovers_same_site_only(self):
         html = """<a href="/contact-us#form">Get in touch</a>
@@ -111,7 +143,8 @@ FIELDS = ["input_id", "link", "title", "category", "address", "website", "phone"
 
 def _row(pid, lat="30.2"):
     return {"title": f"Biz {pid}", "place_id": pid, "cid": "c" + pid, "latitude": lat,
-            "longitude": "-97.7", "phone": "+1 555", "emails": f"{pid.lower()}@biz.net"}
+            "longitude": "-97.7", "phone": "+1 555", "address": f"Biz {pid} - 1 Main St",
+            "emails": f"{pid.lower()}@biz.net, visa@2x.png"}
 
 CELL_ROWS = {"job-1": [_row("A"), _row("B"), _row("C")],
              "job-2": [_row("C"), _row("D")],
@@ -173,10 +206,12 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("cell 4/4: 3 rows, 6 unique so far", text)
         self.assertIn("cell 3/4 skipped", text)
         self.assertIn("dropped 1 rows outside the city box", text)
-        with open(out, newline="") as f:
+        with open(out, newline="", encoding="utf-8-sig") as f:
             rows = list(csv.reader(f))
         self.assertEqual(rows[0], scrape.LEAD)
         self.assertEqual([r[0] for r in rows[1:]], ["Biz A", "Biz B", "Biz C", "Biz D", "Biz E"])
+        lead = dict(zip(rows[0], rows[1]))
+        self.assertEqual((lead["emails"], lead["address"]), ("a@biz.net", "1 Main St"))
 
 
 if __name__ == "__main__":

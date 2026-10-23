@@ -30,6 +30,9 @@ installed, point the user to `SETUP.md`.
 **Recommended fields:**
 - `depth` (default 10): how far to scroll, so roughly how many listings per keyword. Start at `5`.
 - `lang` `"en"`, `zoom` `15` (city level), `radius` `10000` (meters), `fast_mode` `false`.
+  `lang` sets the language of the `category` column. Match the user's market: `"pt"` for Brazil,
+  `"es"` for Spanish-speaking cities. Two letters only: `"pt-BR"` returns `422 invalid lang`.
+  `scripts/scrape.py --lang` and `SCRAPER_LANG` in `.env` do the same.
 - **`email` `true`: on by default in the kit.** Emails are the most valuable lead field. The engine
   visits each business website to find them, which is a little slower. Set `false` only for a
   deliberately fast run without emails.
@@ -92,6 +95,11 @@ outreach), `link`, `plus_code`, `cid`, `data_id`, `place_id`, `open_hours`, `pop
 `--fields "a,b,c"` to choose your own. It **saves a CSV file by default** (`results-<id>.csv`); pass
 `--json` for JSON. If you call the API directly, **strip to the lead fields yourself** before
 presenting. Never dump the full 34-column row at the user.
+
+The script also cleans two engine quirks (`clean_row`). If you call the API directly, do the same:
+- `emails` can hold image names shaped like emails (`visa@2x.png, pix@2x.png`, from payment logos).
+  Drop entries ending in an image, CSS or JS extension.
+- `address` often starts with the business name (`"Acme - 1 Main St, Austin"`). Drop that prefix.
 
 ### Social profiles: always ask the user (Instagram, Facebook, LinkedIn)
 Google Maps has no social links, so socials are an enrichment step: visit each business `website` and

@@ -26,7 +26,16 @@ Notes:
 import argparse, csv, functools, io, json, math, os, re, sys, time, urllib.request, urllib.parse, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
-ENV_KEYS = ("SCRAPER_BASE_URL", "SCRAPER_PORT", "SCRAPER_API_KEY")
+ENV_KEYS = ("SCRAPER_BASE_URL", "SCRAPER_PORT", "SCRAPER_API_KEY", "SCRAPER_LANG")
+
+
+def utf8_console():
+    """Windows consoles and pipes default to a legacy code page (cp1252) that cannot print the
+    ✓ ▶ ℹ status marks, and Python then crashes on the first one. Switch stdout/stderr to UTF-8."""
+    for s in (sys.stdout, sys.stderr):
+        enc = (getattr(s, "encoding", "") or "").lower().replace("-", "").replace("_", "")
+        if enc != "utf8" and hasattr(s, "reconfigure"):
+            s.reconfigure(encoding="utf-8", errors="replace")
 
 
 def load_env_file():
@@ -34,7 +43,7 @@ def load_env_file():
     port needs one edit. Variables already set in the environment win over the file."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, ".env")
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8-sig") as f:
             for line in f:
                 k, sep, v = line.strip().partition("=")
                 if sep and k in ENV_KEYS and k not in os.environ:
@@ -46,6 +55,9 @@ def load_env_file():
 load_env_file()
 BASE = os.environ.get("SCRAPER_BASE_URL") or f"http://localhost:{os.environ.get('SCRAPER_PORT') or '8080'}"
 KEY = os.environ.get("SCRAPER_API_KEY", "")
+# Google Maps interface language: it sets the language of categories ("Uniform store" vs
+# "Loja de uniformes"). Two-letter codes only (en, pt, es, de...): the engine rejects "pt-BR" with 422.
+LANG = os.environ.get("SCRAPER_LANG") or "en"
 # The 8 lead fields: what you use to contact and qualify a lead.
 # Everything else (geo coordinates, IDs, hours, images, review blobs) is dropped by default.
 LEAD = ["title", "phone", "emails", "website", "category", "address", "review_rating", "review_count"]
@@ -160,7 +172,7 @@ def collect_keywords(a):
         kws.append(a.keyword)
     kws.extend(a.also or [])
     if a.keywords_file:
-        with open(a.keywords_file) as f:
+        with open(a.keywords_file, encoding="utf-8-sig") as f:
             kws.extend(line.strip() for line in f if line.strip() and not line.startswith("#"))
     # de-dupe, keep order
     seen, out = set(), []
@@ -244,19 +256,49 @@ def _host(url):
     h = (urllib.parse.urlparse(url).hostname or "").lower()
     return h[4:] if h.startswith("www.") else h
 
+def _junk_email(e):
+    """True for strings that look like emails but are not: image names (logo@2x.png),
+    placeholders (name@company.org) and platform addresses (x@sentry.io)."""
+    local, _, dom = e.rpartition("@")
+    return (not EMAIL_RE.fullmatch(e) or e.endswith(_JUNK_EXT) or local in _JUNK_LOCAL
+            or any(j in dom for j in _JUNK_DOMAIN))
+
 def extract_emails(html, site_host):
     """Emails from mailto: links and plain text, junk dropped, site-domain first, max 3."""
     site = _host(site_host or "")
     found = []
     for e in MAILTO_RE.findall(html or "") + EMAIL_RE.findall(html or ""):
         e = urllib.parse.unquote(e).strip().lower()
-        local, _, dom = e.rpartition("@")
-        if (not EMAIL_RE.fullmatch(e) or e.endswith(_JUNK_EXT) or local in _JUNK_LOCAL
-                or any(j in dom for j in _JUNK_DOMAIN) or e in found):
+        if _junk_email(e) or e in found:
             continue
         found.append(e)
     on_site = lambda e: site and (e.endswith("@" + site) or e.endswith("." + site))
     return sorted(found, key=lambda e: not on_site(e))[:3]
+
+def clean_emails(value):
+    """The engine's comma-separated `emails` with the same junk dropped. The engine keeps
+    anything shaped like an email, so payment logos (visa@2x.png, pix@2x.png) come through."""
+    out = []
+    for e in re.split(r"[,;\s]+", value or ""):
+        e = e.strip().lower()
+        if e and not _junk_email(e) and e not in out:
+            out.append(e)
+    return ", ".join(out)
+
+def clean_address(title, address):
+    """Drop the business name Google puts in front of some addresses:
+    "Acme - 1 Main St, Austin" -> "1 Main St, Austin"."""
+    title, address = (title or "").strip(), (address or "").strip()
+    m = title and re.match(re.escape(title) + r"\s*[-–—,·]\s*", address, re.I)
+    return address[m.end():] if m and address[m.end():] else address
+
+def clean_row(r):
+    """Engine row -> same row with emails and address cleaned (in place, also returned)."""
+    if "emails" in r:
+        r["emails"] = clean_emails(r["emails"])
+    if "address" in r:
+        r["address"] = clean_address(r.get("title"), r["address"])
+    return r
 
 def contact_links(html, base_url):
     """Up to 3 same-site contact/about URLs: discovered links first, then fixed fallbacks."""
@@ -295,6 +337,7 @@ def enrich_emails(results, workers=8):
 
 
 def main():
+    utf8_console()
     ap = argparse.ArgumentParser(description="Scrape Google Maps business listings.")
     ap.add_argument("keyword", nargs="?", help='e.g. "coffee shops in Austin TX"')
     ap.add_argument("lat", nargs="?", help="latitude (optional if --city given)")
@@ -303,6 +346,9 @@ def main():
     ap.add_argument("--keywords-file", help="file with one keyword per line (batch)")
     ap.add_argument("--city", help="city/place to auto-geocode for lat/lon")
     ap.add_argument("--depth", type=int, default=5)
+    ap.add_argument("--lang", default=LANG,
+                    help=f"Google Maps language for categories, two letters: en, pt, es... "
+                         f"(default: SCRAPER_LANG in .env, else en; now {LANG})")
     # Emails are ON by default (they're the most valuable lead field). Visits each business
     # website to find an address — a bit slower. Use --no-email to skip for a fast run.
     ap.add_argument("--email", dest="email", action="store_true", default=True, help=argparse.SUPPRESS)
@@ -370,11 +416,12 @@ def main():
     except Exception as e:
         sys.exit(f"✗ Scraper not reachable at {BASE} — run 'docker compose up -d' first.\n  ({e})")
 
-    body = {"name": "scrape-py", "keywords": keywords, "lang": "en", "zoom": 15,
+    body = {"name": "scrape-py", "keywords": keywords, "lang": a.lang, "zoom": 15,
             "lat": str(lat), "lon": str(lon), "fast_mode": False, "radius": 10000,
             "depth": a.depth, "email": a.email, "max_time": a.max_time}
     if not a.grid:
-        print(f"▶ Creating job: {len(keywords)} keyword(s) @ {lat},{lon} depth={a.depth} email={a.email}")
+        print(f"▶ Creating job: {len(keywords)} keyword(s) @ {lat},{lon} depth={a.depth} "
+              f"email={a.email} lang={a.lang}")
         for k in keywords:
             print(f"    • {k}")
         try:
@@ -403,6 +450,7 @@ def main():
         kept = [r for r in rows if in_bbox(r, bbox)]
         print(f"  dropped {len(rows) - len(kept)} rows outside the city box")
         rows = kept
+    rows = [clean_row(r) for r in rows]
     if a.full:
         fields = list(rows[0].keys()) if rows else LEAD
     elif a.fields:
@@ -433,11 +481,12 @@ def main():
     # Default output is a CSV file (opens in Excel / Google Sheets). Use --json (or a .json --out path) for JSON.
     as_json = a.json or (a.out and a.out.lower().endswith(".json"))
     out = a.out or f"results-{job_id[:8]}.{'json' if as_json else 'csv'}"
+    # Always UTF-8 (Windows would otherwise use cp1252). The CSV gets a BOM so Excel shows accents right.
     if as_json:
-        with open(out, "w") as f:
+        with open(out, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
     else:
-        with open(out, "w", newline="") as f:
+        with open(out, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader()
             w.writerows(results)
